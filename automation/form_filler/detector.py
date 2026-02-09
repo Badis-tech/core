@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 from playwright.async_api import async_playwright, Page, Browser
 
 from automation.models import FormField, FormSchema, FieldType, CaptchaType
+from automation.profiling import ProfilerCollector, ProfilingData
 
 logger = logging.getLogger(__name__)
 
@@ -21,39 +22,79 @@ class FormDetector:
         "dropdown": (FieldType.DROPDOWN, ["select"]),
     }
 
-    def __init__(self, headless: bool = True, timeout: int = 30000):
+    def __init__(self, headless: bool = True, timeout: int = 30000, enable_profiling: bool = False):
         self.headless = headless
         self.timeout = timeout
+        self.enable_profiling = enable_profiling
         self.browser: Optional[Browser] = None
+        self._profiler: Optional[ProfilerCollector] = None
 
-    async def detect_form(self, url: str) -> FormSchema:
+    async def detect_form(self, url: str) -> Tuple[FormSchema, Optional[ProfilingData]]:
         """
         Detect all form fields on a page.
-        Returns structured FormSchema for user confirmation.
+        Returns tuple of (FormSchema, ProfilingData).
         """
+        if self.enable_profiling:
+            self._profiler = ProfilerCollector("form_detection")
+            self._profiler.start()
+
         logger.info(f"Detecting form on {url}")
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.headless)
-            page = await browser.new_page()
+            # Phase 1: Browser Launch
+            if self._profiler:
+                async with self._profiler.profile_phase("browser_launch"):
+                    browser = await p.chromium.launch(headless=self.headless)
+                    page = await browser.new_page()
+            else:
+                browser = await p.chromium.launch(headless=self.headless)
+                page = await browser.new_page()
 
             try:
-                # Navigate and wait for JS rendering
-                await page.goto(url, wait_until="networkidle", timeout=self.timeout)
-                await page.wait_for_load_state("networkidle")
-                await asyncio.sleep(2)  # Buffer for hydration
+                # Phase 2: Page Navigation
+                if self._profiler:
+                    async with self._profiler.profile_phase("page_navigation", url=url):
+                        await page.goto(url, wait_until="networkidle", timeout=self.timeout)
+                else:
+                    await page.goto(url, wait_until="networkidle", timeout=self.timeout)
 
-                # Detect form elements
-                fields = await self._detect_fields(page)
+                # Phase 3: Page Stabilization
+                if self._profiler:
+                    async with self._profiler.profile_phase("page_stabilization"):
+                        await page.wait_for_load_state("networkidle")
+                        await asyncio.sleep(2)  # Buffer for hydration
+                else:
+                    await page.wait_for_load_state("networkidle")
+                    await asyncio.sleep(2)
 
-                # Detect CAPTCHA
-                captcha = await self._detect_captcha(page)
+                # Phase 4: Field Detection
+                if self._profiler:
+                    async with self._profiler.profile_phase("field_detection"):
+                        fields = await self._detect_fields(page)
+                    self._profiler.metadata['field_count'] = len(fields)
+                else:
+                    fields = await self._detect_fields(page)
 
-                # Detect submit button
-                submit_selector = await self._find_submit_button(page)
+                # Phase 5: CAPTCHA Detection
+                if self._profiler:
+                    async with self._profiler.profile_phase("captcha_detection"):
+                        captcha = await self._detect_captcha(page)
+                else:
+                    captcha = await self._detect_captcha(page)
 
-                # Check if multistep form
-                is_multistep = await self._is_multistep(page)
+                # Phase 6: Submit Button Detection
+                if self._profiler:
+                    async with self._profiler.profile_phase("submit_detection"):
+                        submit_selector = await self._find_submit_button(page)
+                else:
+                    submit_selector = await self._find_submit_button(page)
+
+                # Phase 7: Multistep Detection
+                if self._profiler:
+                    async with self._profiler.profile_phase("multistep_detection"):
+                        is_multistep = await self._is_multistep(page)
+                else:
+                    is_multistep = await self._is_multistep(page)
 
                 schema = FormSchema(
                     url=url,
@@ -64,13 +105,19 @@ class FormDetector:
                 )
 
                 logger.info(f"Detected {len(fields)} fields on {url}")
-                return schema
+                profiling = self._profiler.finish() if self._profiler else None
+                return schema, profiling
 
             except Exception as e:
                 logger.error(f"Error detecting form on {url}: {e}")
                 raise
             finally:
-                await browser.close()
+                # Phase 8: Browser Cleanup
+                if self._profiler:
+                    async with self._profiler.profile_phase("browser_cleanup"):
+                        await browser.close()
+                else:
+                    await browser.close()
 
     async def _detect_fields(self, page: Page) -> List[FormField]:
         """Find all form inputs, textareas, selects"""
@@ -248,7 +295,7 @@ class FormDetector:
         return False
 
 
-async def detect_form(url: str) -> FormSchema:
+async def detect_form(url: str, enable_profiling: bool = False) -> Tuple[FormSchema, Optional[ProfilingData]]:
     """Convenience function to detect form"""
-    detector = FormDetector()
+    detector = FormDetector(enable_profiling=enable_profiling)
     return await detector.detect_form(url)

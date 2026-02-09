@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Quick test script for form detection
+Quick test script for form detection with profiling
 """
 
 import asyncio
 import json
 from pathlib import Path
+from datetime import datetime
 
 from automation.models import Candidate
 from automation.form_filler import FormDetector, FormFiller
+from automation.profiling import format_profiling_report
 
 
 async def test_detect_form():
-    """Test form detection on a real URL"""
+    """Test form detection on a real URL with profiling"""
     # German nursing schools with online forms
     test_urls = [
         # TIER 1 - Direct online forms (easiest to automate)
@@ -26,15 +28,18 @@ async def test_detect_form():
         "https://www.eh-berlin.de/en/study-programs/bachelor/bachelor-of-nursing",
     ]
 
-    detector = FormDetector(headless=True)
+    # Create detector with profiling enabled
+    detector = FormDetector(headless=True, enable_profiling=True)
+
+    profiling_results = []
 
     for url in test_urls:
-        print(f"\n{'='*60}")
+        print(f"\n{'='*70}")
         print(f"Testing: {url}")
-        print(f"{'='*60}")
+        print(f"{'='*70}")
 
         try:
-            schema = await detector.detect_form(url)
+            schema, profiling = await detector.detect_form(url)
 
             print(f"\n✓ Form detected")
             print(f"  Fields found: {len(schema.fields)}")
@@ -50,8 +55,18 @@ async def test_detect_form():
                     f"Inferred: {field.inferred_candidate_field}"
                 )
 
+            # Display profiling report
+            if profiling:
+                print(format_profiling_report(profiling))
+                profiling_results.append({
+                    "url": url,
+                    "duration_ms": profiling.total_duration_ms,
+                    "field_count": len(schema.fields),
+                    "profiling": profiling,
+                })
+
             # Save schema to JSON for inspection
-            schema_json = Path("form_schema.json")
+            schema_json = Path(f"form_schema_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
             with open(schema_json, "w") as f:
                 schema_data = {
                     "url": schema.url,
@@ -69,15 +84,27 @@ async def test_detect_form():
                     "captcha_type": schema.captcha_type,
                     "submit_selector": schema.submit_selector,
                 }
-                json.dump(schema_data, f, indent=2)
+                if profiling:
+                    schema_data["profiling"] = profiling.dict()
+                json.dump(schema_data, f, indent=2, default=str)
 
-            print(f"\n✓ Schema saved to form_schema.json")
+            print(f"\n✓ Schema saved to {schema_json}")
 
         except Exception as e:
             print(f"✗ Error: {e}")
             import traceback
 
             traceback.print_exc()
+
+    # Summary comparison
+    if profiling_results:
+        print(f"\n\n{'='*70}")
+        print("PROFILING SUMMARY")
+        print(f"{'='*70}")
+        print(f"{'URL':<50} {'Duration (ms)':<15}")
+        print("-" * 70)
+        for result in sorted(profiling_results, key=lambda x: x["duration_ms"], reverse=True):
+            print(f"{result['url'][:50]:<50} {result['duration_ms']:>10.2f} ms")
 
 
 async def test_fill_form():

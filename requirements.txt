@@ -19,6 +19,9 @@ httpx>=0.26.0
 # Data processing
 polars>=0.20.0
 
+# System monitoring
+psutil>=5.9.0
+
 # Environment
 python-dotenv>=1.0.0
 

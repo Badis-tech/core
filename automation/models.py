@@ -3,6 +3,9 @@ from enum import Enum
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
+# Import profiling models
+from automation.profiling import ProfilingData
+
 
 class FieldType(str, Enum):
     """Form field classifications"""
@@ -118,6 +121,7 @@ class ApplicationRecord(BaseModel):
     requires_manual_action: bool = False
     manual_action_type: Optional[str] = None  # "captcha", "field_mapping", etc
     batch_id: Optional[str] = None
+    profiling: Optional[ProfilingData] = None  # Performance profiling data
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 

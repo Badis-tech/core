@@ -7,6 +7,7 @@ from datetime import datetime
 
 from playwright.async_api import async_playwright, Page
 from automation.models import FormSchema, Candidate, ApplicationRecord, CaptchaType, ErrorType
+from automation.profiling import ProfilerCollector, ProfilingData
 
 logger = logging.getLogger(__name__)
 
@@ -14,9 +15,11 @@ logger = logging.getLogger(__name__)
 class FormFiller:
     """Fill and submit forms with candidate data"""
 
-    def __init__(self, headless: bool = True, timeout: int = 60000):
+    def __init__(self, headless: bool = True, timeout: int = 60000, enable_profiling: bool = False):
         self.headless = headless
         self.timeout = timeout
+        self.enable_profiling = enable_profiling
+        self._profiler: Optional[ProfilerCollector] = None
 
     async def fill_and_submit(
         self,
@@ -28,6 +31,10 @@ class FormFiller:
         Fill form with candidate data and submit.
         Returns ApplicationRecord with submission result.
         """
+        if self.enable_profiling:
+            self._profiler = ProfilerCollector("form_filling")
+            self._profiler.start()
+
         logger.info(f"Filling form at {form_schema.url} for {candidate.name}")
 
         record = ApplicationRecord(
@@ -39,73 +46,132 @@ class FormFiller:
         Path(screenshot_dir).mkdir(exist_ok=True)
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.headless)
-            page = await browser.new_page()
+            # Phase 1: Browser Launch
+            if self._profiler:
+                async with self._profiler.profile_phase("browser_launch"):
+                    browser = await p.chromium.launch(headless=self.headless)
+                    page = await browser.new_page()
+            else:
+                browser = await p.chromium.launch(headless=self.headless)
+                page = await browser.new_page()
 
             try:
-                # Navigate to form
-                await page.goto(form_schema.url, wait_until="networkidle", timeout=self.timeout)
-                await asyncio.sleep(1)
+                # Phase 2: Page Navigation
+                if self._profiler:
+                    async with self._profiler.profile_phase("page_navigation", url=form_schema.url):
+                        await page.goto(form_schema.url, wait_until="networkidle", timeout=self.timeout)
+                else:
+                    await page.goto(form_schema.url, wait_until="networkidle", timeout=self.timeout)
 
-                # Check for CAPTCHA
-                if form_schema.captcha_type != "none":
+                # Phase 3: Page Stabilization
+                if self._profiler:
+                    async with self._profiler.profile_phase("page_stabilization"):
+                        await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(1)
+
+                # Phase 4: CAPTCHA Check
+                if self._profiler:
+                    async with self._profiler.profile_phase("captcha_check"):
+                        captcha_found = form_schema.captcha_type != "none"
+                else:
+                    captcha_found = form_schema.captcha_type != "none"
+
+                if captcha_found:
                     logger.warning(f"CAPTCHA detected: {form_schema.captcha_type}")
                     record.status = "captcha_quarantine"
                     record.requires_manual_action = True
                     record.manual_action_type = "captcha"
                     screenshot = await self._take_screenshot(page, screenshot_dir)
                     record.screenshot_path = screenshot
+                    record.profiling = self._profiler.finish() if self._profiler else None
                     await browser.close()
                     return record
 
-                # Map candidate data to form fields
-                field_data = self._map_candidate_to_form(candidate, form_schema)
+                # Phase 5: Field Mapping
+                if self._profiler:
+                    async with self._profiler.profile_phase("field_mapping"):
+                        field_data = self._map_candidate_to_form(candidate, form_schema)
+                else:
+                    field_data = self._map_candidate_to_form(candidate, form_schema)
 
                 if not field_data:
                     record.status = "failed"
                     record.error_type = ErrorType.VALIDATION
                     record.last_error = "Could not map candidate data to form fields"
+                    record.profiling = self._profiler.finish() if self._profiler else None
                     await browser.close()
                     return record
 
-                # Fill form fields
-                fill_result = await self._fill_fields(page, form_schema, field_data, candidate)
+                # Phase 6: Field Filling
+                if self._profiler:
+                    async with self._profiler.profile_phase("field_filling"):
+                        fill_result = await self._fill_fields(page, form_schema, field_data, candidate)
+                else:
+                    fill_result = await self._fill_fields(page, form_schema, field_data, candidate)
+
                 if not fill_result["success"]:
                     record.status = "failed"
                     record.error_type = ErrorType.FIELD_NOT_FOUND
                     record.last_error = fill_result.get("error")
                     screenshot = await self._take_screenshot(page, screenshot_dir)
                     record.screenshot_path = screenshot
+                    record.profiling = self._profiler.finish() if self._profiler else None
                     await browser.close()
                     return record
 
-                # Take screenshot before submit
-                pre_submit_screenshot = await self._take_screenshot(page, screenshot_dir, suffix="_pre_submit")
+                # Phase 7: Pre-Submit Screenshot
+                if self._profiler:
+                    async with self._profiler.profile_phase("screenshot_pre_submit"):
+                        pre_submit_screenshot = await self._take_screenshot(page, screenshot_dir, suffix="_pre_submit")
+                    self._profiler.metadata['screenshot_count'] = 1
+                else:
+                    pre_submit_screenshot = await self._take_screenshot(page, screenshot_dir, suffix="_pre_submit")
 
-                # Submit form
-                submit_result = await self._submit_form(page, form_schema)
+                # Phase 8: Form Submission
+                if self._profiler:
+                    async with self._profiler.profile_phase("form_submission"):
+                        submit_result = await self._submit_form(page, form_schema)
+                else:
+                    submit_result = await self._submit_form(page, form_schema)
+
                 if not submit_result["success"]:
                     record.status = "failed"
                     record.error_type = ErrorType.SUBMIT_FAILED
                     record.last_error = submit_result.get("error")
                     record.screenshot_path = pre_submit_screenshot
+                    record.profiling = self._profiler.finish() if self._profiler else None
                     await browser.close()
                     return record
 
-                # Wait for post-submit page
-                await asyncio.sleep(2)
+                # Phase 9: Post-Submit Wait
+                if self._profiler:
+                    async with self._profiler.profile_phase("post_submit_wait"):
+                        await asyncio.sleep(2)
+                else:
+                    await asyncio.sleep(2)
 
-                # Take final screenshot
-                post_submit_screenshot = await self._take_screenshot(page, screenshot_dir, suffix="_post_submit")
+                # Phase 10: Post-Submit Screenshot
+                if self._profiler:
+                    async with self._profiler.profile_phase("screenshot_post_submit"):
+                        post_submit_screenshot = await self._take_screenshot(page, screenshot_dir, suffix="_post_submit")
+                    self._profiler.metadata['screenshot_count'] = 2
+                else:
+                    post_submit_screenshot = await self._take_screenshot(page, screenshot_dir, suffix="_post_submit")
 
-                # Check for success indicator
-                success = await self._check_success(page, form_schema)
+                # Phase 11: Success Detection
+                if self._profiler:
+                    async with self._profiler.profile_phase("success_detection"):
+                        success = await self._check_success(page, form_schema)
+                else:
+                    success = await self._check_success(page, form_schema)
 
                 record.status = "success" if success else "submitted"
                 record.form_data_submitted = field_data
                 record.submitted_at = datetime.utcnow()
                 record.screenshot_path = post_submit_screenshot
                 record.attempt_count = 1
+                record.profiling = self._profiler.finish() if self._profiler else None
 
                 logger.info(f"Successfully submitted form at {form_schema.url}")
 
@@ -114,9 +180,15 @@ class FormFiller:
                 record.status = "failed"
                 record.error_type = ErrorType.UNKNOWN
                 record.last_error = str(e)
+                record.profiling = self._profiler.finish() if self._profiler else None
 
             finally:
-                await browser.close()
+                # Phase 12: Browser Cleanup
+                if self._profiler:
+                    async with self._profiler.profile_phase("browser_cleanup"):
+                        await browser.close()
+                else:
+                    await browser.close()
 
         return record
 
@@ -251,7 +323,8 @@ async def fill_and_submit(
     form_schema: FormSchema,
     candidate: Candidate,
     screenshot_dir: str = "./screenshots",
+    enable_profiling: bool = False,
 ) -> ApplicationRecord:
     """Convenience function to fill and submit form"""
-    filler = FormFiller()
+    filler = FormFiller(enable_profiling=enable_profiling)
     return await filler.fill_and_submit(form_schema, candidate, screenshot_dir)
