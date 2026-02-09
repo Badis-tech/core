@@ -67,34 +67,28 @@ class FormDetector:
                     await page.wait_for_load_state("networkidle")
                     await asyncio.sleep(2)
 
-                # Phase 4: Field Detection
+                # Phase 4-7: Parallel Detection (batch queries)
                 if self._profiler:
-                    async with self._profiler.profile_phase("field_detection"):
-                        fields = await self._detect_fields(page)
+                    async with self._profiler.profile_phase("parallel_detection"):
+                        # Run all detection phases in parallel using asyncio.gather
+                        fields_data, captcha_data, submit_data, multistep_data = await asyncio.gather(
+                            self._detect_fields_batch(page),
+                            self._detect_captcha_batch(page),
+                            self._find_submit_button_batch(page),
+                            self._is_multistep(page)
+                        )
+                        fields = fields_data
+                        captcha = captcha_data
+                        submit_selector = submit_data
+                        is_multistep = multistep_data
                     self._profiler.metadata['field_count'] = len(fields)
                 else:
-                    fields = await self._detect_fields(page)
-
-                # Phase 5: CAPTCHA Detection
-                if self._profiler:
-                    async with self._profiler.profile_phase("captcha_detection"):
-                        captcha = await self._detect_captcha(page)
-                else:
-                    captcha = await self._detect_captcha(page)
-
-                # Phase 6: Submit Button Detection
-                if self._profiler:
-                    async with self._profiler.profile_phase("submit_detection"):
-                        submit_selector = await self._find_submit_button(page)
-                else:
-                    submit_selector = await self._find_submit_button(page)
-
-                # Phase 7: Multistep Detection
-                if self._profiler:
-                    async with self._profiler.profile_phase("multistep_detection"):
-                        is_multistep = await self._is_multistep(page)
-                else:
-                    is_multistep = await self._is_multistep(page)
+                    fields, captcha, submit_selector, is_multistep = await asyncio.gather(
+                        self._detect_fields_batch(page),
+                        self._detect_captcha_batch(page),
+                        self._find_submit_button_batch(page),
+                        self._is_multistep(page)
+                    )
 
                 schema = FormSchema(
                     url=url,
@@ -119,75 +113,93 @@ class FormDetector:
                 else:
                     await browser.close()
 
-    async def _detect_fields(self, page: Page) -> List[FormField]:
-        """Find all form inputs, textareas, selects"""
-        fields = []
+    async def _detect_fields_batch(self, page: Page) -> List[FormField]:
+        """Detect all form fields using a single batched JavaScript query"""
+        try:
+            # Execute all field detection in browser context with single call
+            fields_data = await page.evaluate("""
+            () => {
+                function getLabel(elem) {
+                    // Try label[for=name]
+                    if (elem.name) {
+                        const labelFor = document.querySelector(`label[for="${elem.name}"]`);
+                        if (labelFor) return labelFor.textContent.trim();
+                    }
 
-        # Query all form elements
-        selectors = ["input", "textarea", "select"]
+                    // Try wrapping label
+                    let parent = elem.parentElement;
+                    while (parent && parent.tagName !== 'FORM') {
+                        if (parent.tagName === 'LABEL') {
+                            return parent.textContent.trim();
+                        }
+                        parent = parent.parentElement;
+                    }
+                    return null;
+                }
 
-        for selector in selectors:
-            elements = await page.locator(selector).all()
+                const selectors = ['input', 'textarea', 'select'];
+                const elements = document.querySelectorAll(selectors.join(','));
 
-            for i, elem in enumerate(elements):
+                const result = [];
+                for (const elem of elements) {
+                    // Skip hidden/disabled
+                    if (elem.offsetParent === null || elem.disabled) {
+                        continue;
+                    }
+
+                    const name = elem.getAttribute('name');
+                    if (!name) continue;
+
+                    result.push({
+                        tagName: elem.tagName.toLowerCase(),
+                        type: elem.getAttribute('type') || 'text',
+                        name: name,
+                        placeholder: elem.getAttribute('placeholder'),
+                        required: elem.hasAttribute('required'),
+                        label: getLabel(elem)
+                    });
+                }
+                return result;
+            }
+            """)
+
+            fields = []
+            for field_data in fields_data:
                 try:
-                    # Skip hidden/disabled fields
-                    if await elem.is_hidden() or await elem.is_disabled():
-                        continue
-
-                    html_type = await elem.get_attribute("type") or "text"
-                    name = await elem.get_attribute("name")
-
-                    if not name:  # Skip fields without names
-                        continue
-
-                    placeholder = await elem.get_attribute("placeholder")
-                    required = await elem.get_attribute("required") is not None
-
-                    # Find associated label
-                    label_text = await self._get_field_label(page, name)
-
-                    # Classify field type
-                    field_type = self._classify_field(name, html_type, placeholder, label_text)
-
-                    # Infer candidate field
-                    inferred = self._infer_candidate_field(field_type, name)
-
-                    field = FormField(
-                        selector=f"{selector}[name='{name}']",
-                        name=name,
-                        html_type=html_type,
-                        field_type=field_type,
-                        required=required,
-                        placeholder=placeholder,
-                        label_text=label_text,
-                        inferred_candidate_field=inferred,
+                    field_type = self._classify_field(
+                        field_data['name'],
+                        field_data['type'],
+                        field_data['placeholder'],
+                        field_data['label']
                     )
 
-                    fields.append(field)
+                    inferred = self._infer_candidate_field(field_type, field_data['name'])
 
+                    field = FormField(
+                        selector=f"{field_data['tagName']}[name='{field_data['name']}']",
+                        name=field_data['name'],
+                        html_type=field_data['type'],
+                        field_type=field_type,
+                        required=field_data['required'],
+                        placeholder=field_data['placeholder'],
+                        label_text=field_data['label'],
+                        inferred_candidate_field=inferred,
+                    )
+                    fields.append(field)
                 except Exception as e:
-                    logger.warning(f"Error processing field {i}: {e}")
+                    logger.warning(f"Error processing field {field_data['name']}: {e}")
                     continue
 
-        return fields
+            return fields
 
-    async def _get_field_label(self, page: Page, field_name: str) -> Optional[str]:
-        """Find label associated with field"""
-        try:
-            # Try label with for attribute
-            label = await page.locator(f"label[for='{field_name}']").first.text_content()
-            if label:
-                return label.strip()
+        except Exception as e:
+            logger.error(f"Error in batch field detection: {e}")
+            return []
 
-            # Try label wrapping the input
-            label = await page.locator(f"label:has(input[name='{field_name}'])").first.text_content()
-            if label:
-                return label.strip()
-        except:
-            pass
+    async def _detect_fields(self, page: Page) -> List[FormField]:
+        """Deprecated: Use _detect_fields_batch instead. Kept for backwards compatibility."""
+        return await self._detect_fields_batch(page)
 
-        return None
 
     def _classify_field(self, name: str, html_type: str, placeholder: str = None, label: str = None) -> FieldType:
         """Classify field based on name, type, placeholder, label"""
@@ -235,49 +247,81 @@ class FormDetector:
 
         return mapping.get(field_type, "candidate.unknown")
 
-    async def _detect_captcha(self, page: Page) -> CaptchaType:
-        """Detect CAPTCHA type on page"""
-        # reCAPTCHA v2
-        if await page.locator('[data-sitekey]').count() > 0:
-            return CaptchaType.RECAPTCHA_V2
+    async def _detect_captcha_batch(self, page: Page) -> CaptchaType:
+        """Detect CAPTCHA type using single batched query"""
+        try:
+            captcha_data = await page.evaluate("""
+            () => ({
+                hasRecaptchaV2: document.querySelector('[data-sitekey]') !== null,
+                hasHcaptcha: document.querySelector('.h-captcha') !== null,
+                hasCloudflare: document.querySelector('.cf-turnstile') !== null,
+                hasRecaptchaV3: Array.from(document.scripts).some(s =>
+                    s.src.includes('recaptcha') && s.src.includes('v3')
+                )
+            })
+            """)
 
-        # hCaptcha
-        if await page.locator('.h-captcha').count() > 0:
-            return CaptchaType.HCAPTCHA
-
-        # Cloudflare Turnstile
-        if await page.locator('.cf-turnstile').count() > 0:
-            return CaptchaType.CLOUDFLARE
-
-        # reCAPTCHA v3 (harder to detect)
-        if await page.locator('script[src*="recaptcha"]').count() > 0:
-            scripts = await page.locator('script[src*="recaptcha"]').get_attribute('src')
-            if 'v3' in scripts:
+            if captcha_data['hasRecaptchaV2']:
+                return CaptchaType.RECAPTCHA_V2
+            if captcha_data['hasHcaptcha']:
+                return CaptchaType.HCAPTCHA
+            if captcha_data['hasCloudflare']:
+                return CaptchaType.CLOUDFLARE
+            if captcha_data['hasRecaptchaV3']:
                 return CaptchaType.RECAPTCHA_V3
 
-        return CaptchaType.NONE
+            return CaptchaType.NONE
+
+        except Exception as e:
+            logger.warning(f"Error in CAPTCHA detection: {e}")
+            return CaptchaType.NONE
+
+    async def _detect_captcha(self, page: Page) -> CaptchaType:
+        """Deprecated: Use _detect_captcha_batch instead."""
+        return await self._detect_captcha_batch(page)
+
+    async def _find_submit_button_batch(self, page: Page) -> Optional[str]:
+        """Find submit button using single batched query"""
+        try:
+            selectors = [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button.submit",
+                "button.btn-primary",
+                "a.btn-submit",
+            ]
+
+            submit_selector = await page.evaluate(f"""
+            () => {{
+                const selectors = {selectors};
+                for (const selector of selectors) {{
+                    if (document.querySelector(selector)) {{
+                        return selector;
+                    }}
+                }}
+
+                // Try text-based buttons (case insensitive)
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {{
+                    const text = btn.textContent.toLowerCase().trim();
+                    if (text === 'submit' || text === 'absenden' || text === 'senden') {{
+                        return 'button[type="submit"]:not([disabled])';
+                    }}
+                }}
+
+                return null;
+            }}
+            """)
+
+            return submit_selector
+
+        except Exception as e:
+            logger.warning(f"Error in submit button detection: {e}")
+            return None
 
     async def _find_submit_button(self, page: Page) -> Optional[str]:
-        """Find form submit button selector"""
-        selectors = [
-            "button[type='submit']",
-            "input[type='submit']",
-            "button.submit",
-            "button.btn-primary",
-            "a.btn-submit",
-            "button:has-text('Submit')",
-            "button:has-text('Absenden')",  # German
-            "button:has-text('Senden')",    # German
-        ]
-
-        for selector in selectors:
-            try:
-                if await page.locator(selector).count() > 0:
-                    return selector
-            except:
-                continue
-
-        return None
+        """Deprecated: Use _find_submit_button_batch instead."""
+        return await self._find_submit_button_batch(page)
 
     async def _is_multistep(self, page: Page) -> bool:
         """Check if form is multi-step"""
