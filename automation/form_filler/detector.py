@@ -1,0 +1,254 @@
+import asyncio
+import logging
+from typing import List, Optional, Tuple
+from playwright.async_api import async_playwright, Page, Browser
+
+from automation.models import FormField, FormSchema, FieldType, CaptchaType
+
+logger = logging.getLogger(__name__)
+
+
+class FormDetector:
+    """Detect and classify form fields on web pages"""
+
+    FIELD_CLASSIFICATIONS = {
+        "email": (FieldType.EMAIL, ["email", "mail"]),
+        "phone": (FieldType.PHONE, ["phone", "mobile", "tel", "telefon"]),
+        "first_name": (FieldType.FIRST_NAME, ["first", "fname", "vorname"]),
+        "last_name": (FieldType.LAST_NAME, ["last", "lname", "surname", "nachname"]),
+        "file": (FieldType.FILE_UPLOAD, ["file", "cv", "resume", "lebenslauf", "upload"]),
+        "checkbox": (FieldType.CHECKBOX, ["checkbox"]),
+        "dropdown": (FieldType.DROPDOWN, ["select"]),
+    }
+
+    def __init__(self, headless: bool = True, timeout: int = 30000):
+        self.headless = headless
+        self.timeout = timeout
+        self.browser: Optional[Browser] = None
+
+    async def detect_form(self, url: str) -> FormSchema:
+        """
+        Detect all form fields on a page.
+        Returns structured FormSchema for user confirmation.
+        """
+        logger.info(f"Detecting form on {url}")
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=self.headless)
+            page = await browser.new_page()
+
+            try:
+                # Navigate and wait for JS rendering
+                await page.goto(url, wait_until="networkidle", timeout=self.timeout)
+                await page.wait_for_load_state("networkidle")
+                await asyncio.sleep(2)  # Buffer for hydration
+
+                # Detect form elements
+                fields = await self._detect_fields(page)
+
+                # Detect CAPTCHA
+                captcha = await self._detect_captcha(page)
+
+                # Detect submit button
+                submit_selector = await self._find_submit_button(page)
+
+                # Check if multistep form
+                is_multistep = await self._is_multistep(page)
+
+                schema = FormSchema(
+                    url=url,
+                    fields=fields,
+                    captcha_type=captcha,
+                    submit_selector=submit_selector or "button[type='submit']",
+                    is_multistep=is_multistep,
+                )
+
+                logger.info(f"Detected {len(fields)} fields on {url}")
+                return schema
+
+            except Exception as e:
+                logger.error(f"Error detecting form on {url}: {e}")
+                raise
+            finally:
+                await browser.close()
+
+    async def _detect_fields(self, page: Page) -> List[FormField]:
+        """Find all form inputs, textareas, selects"""
+        fields = []
+
+        # Query all form elements
+        selectors = ["input", "textarea", "select"]
+
+        for selector in selectors:
+            elements = await page.locator(selector).all()
+
+            for i, elem in enumerate(elements):
+                try:
+                    # Skip hidden/disabled fields
+                    if await elem.is_hidden() or await elem.is_disabled():
+                        continue
+
+                    html_type = await elem.get_attribute("type") or "text"
+                    name = await elem.get_attribute("name")
+
+                    if not name:  # Skip fields without names
+                        continue
+
+                    placeholder = await elem.get_attribute("placeholder")
+                    required = await elem.get_attribute("required") is not None
+
+                    # Find associated label
+                    label_text = await self._get_field_label(page, name)
+
+                    # Classify field type
+                    field_type = self._classify_field(name, html_type, placeholder, label_text)
+
+                    # Infer candidate field
+                    inferred = self._infer_candidate_field(field_type, name)
+
+                    field = FormField(
+                        selector=f"{selector}[name='{name}']",
+                        name=name,
+                        html_type=html_type,
+                        field_type=field_type,
+                        required=required,
+                        placeholder=placeholder,
+                        label_text=label_text,
+                        inferred_candidate_field=inferred,
+                    )
+
+                    fields.append(field)
+
+                except Exception as e:
+                    logger.warning(f"Error processing field {i}: {e}")
+                    continue
+
+        return fields
+
+    async def _get_field_label(self, page: Page, field_name: str) -> Optional[str]:
+        """Find label associated with field"""
+        try:
+            # Try label with for attribute
+            label = await page.locator(f"label[for='{field_name}']").first.text_content()
+            if label:
+                return label.strip()
+
+            # Try label wrapping the input
+            label = await page.locator(f"label:has(input[name='{field_name}'])").first.text_content()
+            if label:
+                return label.strip()
+        except:
+            pass
+
+        return None
+
+    def _classify_field(self, name: str, html_type: str, placeholder: str = None, label: str = None) -> FieldType:
+        """Classify field based on name, type, placeholder, label"""
+        name_lower = name.lower()
+        html_type_lower = html_type.lower()
+        placeholder_lower = placeholder.lower() if placeholder else ""
+        label_lower = label.lower() if label else ""
+
+        # Check HTML type first
+        if html_type_lower == "email":
+            return FieldType.EMAIL
+        if html_type_lower == "tel":
+            return FieldType.PHONE
+        if html_type_lower == "file":
+            return FieldType.FILE_UPLOAD
+        if html_type_lower == "checkbox":
+            return FieldType.CHECKBOX
+        if html_type_lower == "date":
+            return FieldType.DATE
+
+        # Check against heuristics
+        for field_type, (classified_type, keywords) in self.FIELD_CLASSIFICATIONS.items():
+            for keyword in keywords:
+                if keyword in name_lower or keyword in placeholder_lower or keyword in label_lower:
+                    return classified_type
+
+        # Default classification
+        if html_type_lower == "textarea":
+            return FieldType.LONG_TEXT
+        if html_type_lower == "select":
+            return FieldType.DROPDOWN
+
+        return FieldType.TEXT
+
+    def _infer_candidate_field(self, field_type: FieldType, name: str) -> str:
+        """Map form field to candidate attribute"""
+        mapping = {
+            FieldType.EMAIL: "candidate.email",
+            FieldType.PHONE: "candidate.phone",
+            FieldType.FIRST_NAME: "candidate.first_name",
+            FieldType.LAST_NAME: "candidate.last_name",
+            FieldType.FILE_UPLOAD: "candidate.cv_file",
+            FieldType.LONG_TEXT: "candidate.motivation",
+        }
+
+        return mapping.get(field_type, "candidate.unknown")
+
+    async def _detect_captcha(self, page: Page) -> CaptchaType:
+        """Detect CAPTCHA type on page"""
+        # reCAPTCHA v2
+        if await page.locator('[data-sitekey]').count() > 0:
+            return CaptchaType.RECAPTCHA_V2
+
+        # hCaptcha
+        if await page.locator('.h-captcha').count() > 0:
+            return CaptchaType.HCAPTCHA
+
+        # Cloudflare Turnstile
+        if await page.locator('.cf-turnstile').count() > 0:
+            return CaptchaType.CLOUDFLARE
+
+        # reCAPTCHA v3 (harder to detect)
+        if await page.locator('script[src*="recaptcha"]').count() > 0:
+            scripts = await page.locator('script[src*="recaptcha"]').get_attribute('src')
+            if 'v3' in scripts:
+                return CaptchaType.RECAPTCHA_V3
+
+        return CaptchaType.NONE
+
+    async def _find_submit_button(self, page: Page) -> Optional[str]:
+        """Find form submit button selector"""
+        selectors = [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button.submit",
+            "button.btn-primary",
+            "a.btn-submit",
+            "button:has-text('Submit')",
+            "button:has-text('Absenden')",  # German
+            "button:has-text('Senden')",    # German
+        ]
+
+        for selector in selectors:
+            try:
+                if await page.locator(selector).count() > 0:
+                    return selector
+            except:
+                continue
+
+        return None
+
+    async def _is_multistep(self, page: Page) -> bool:
+        """Check if form is multi-step"""
+        indicators = [
+            page.locator("[class*='progress']"),
+            page.locator("[class*='step']"),
+            page.locator("button:has-text('Next')"),
+            page.locator("button:has-text('Weiter')"),  # German
+        ]
+
+        for indicator in indicators:
+            if await indicator.count() > 0:
+                return True
+
+        return False
+
+
+async def detect_form(url: str) -> FormSchema:
+    """Convenience function to detect form"""
+    detector = FormDetector()
+    return await detector.detect_form(url)
